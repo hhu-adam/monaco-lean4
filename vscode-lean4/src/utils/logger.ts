@@ -1,4 +1,4 @@
-import { Console } from 'console'
+import { Console } from './console'
 
 class Logger extends Console {
     constructor(stdout: NodeJS.WritableStream, stderr?: NodeJS.WritableStream) {

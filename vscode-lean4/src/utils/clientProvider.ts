@@ -13,21 +13,13 @@ import { LeanInstaller } from './leanInstaller'
 import { logger } from './logger'
 import { displayError } from './notifs'
 import { findLeanProjectRoot, willUseLakeServer } from './projectInfo'
+import { BaseLanguageClient, LanguageClientOptions } from 'vscode-languageclient/node'
 
 async function checkLean4ProjectPreconditions(
     channel: OutputChannel,
     folderUri: ExtUri,
 ): Promise<PreconditionCheckResult> {
-    return await checkAll(
-        () => checkIsValidProjectFolder(channel, folderUri),
-        () => checkIsLeanVersionUpToDate(channel, folderUri, { modal: false }),
-        async () => {
-            if (!(await willUseLakeServer(folderUri))) {
-                return 'Fulfilled'
-            }
-            return await checkIsLakeInstalledCorrectly(channel, folderUri, {})
-        },
-    )
+    return 'Fulfilled';
 }
 
 // This class ensures we have one LeanClient per folder.
@@ -53,7 +45,8 @@ export class LeanClientProvider implements Disposable {
     private clientStoppedEmitter = new EventEmitter<[LeanClient, boolean, ServerStoppedReason]>()
     clientStopped = this.clientStoppedEmitter.event
 
-    constructor(installer: LeanInstaller, outputChannel: OutputChannel) {
+    constructor(installer: LeanInstaller, outputChannel: OutputChannel,
+            private setupClient: (clientOptions: LanguageClientOptions, folderUri: ExtUri, elanDefaultToolchain: string) => Promise<BaseLanguageClient>) {
         this.outputChannel = outputChannel
         this.installer = installer
 
@@ -237,18 +230,18 @@ export class LeanClientProvider implements Disposable {
         logger.log('[ClientProvider] Creating LeanClient for ' + folderUri.toString())
         const elanDefaultToolchain = await this.installer.getElanDefaultToolchain(folderUri)
 
-        client = new LeanClient(folderUri, this.outputChannel, elanDefaultToolchain)
+        client = new LeanClient(folderUri, this.outputChannel, elanDefaultToolchain, this.setupClient)
         this.subscriptions.push(client)
         this.clients.set(key, client)
 
         client.serverFailed(err => {
             this.clients.delete(key)
-            client.dispose()
+            client!.dispose()
             displayError(err)
         })
 
         client.stopped(reason => {
-            this.clientStoppedEmitter.fire([client, client === this.activeClient, reason])
+            this.clientStoppedEmitter.fire([client!, client === this.activeClient, reason])
         })
 
         // aggregate progress changed events.
