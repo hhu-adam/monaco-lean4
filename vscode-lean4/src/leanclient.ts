@@ -15,16 +15,15 @@ import {
     WorkspaceFolder,
 } from 'vscode'
 import {
+    BaseLanguageClient,
     DiagnosticSeverity,
     DidChangeTextDocumentParams,
     DidCloseTextDocumentParams,
     DocumentFilter,
     InitializeResult,
-    LanguageClient,
     LanguageClientOptions,
     PublishDiagnosticsParams,
     RevealOutputChannelOn,
-    ServerOptions,
     State,
 } from 'vscode-languageclient/node'
 import * as ls from 'vscode-languageserver-protocol'
@@ -33,16 +32,12 @@ import { LeanFileProgressParams, LeanFileProgressProcessingInfo, ServerStoppedRe
 import {
     getElaborationDelay,
     getFallBackToStringOccurrenceHighlighting,
-    serverArgs,
-    serverLoggingEnabled,
-    serverLoggingPath,
     shouldAutofocusOutput,
 } from './config'
 import { logger } from './utils/logger'
 // @ts-ignore
 import { SemVer } from 'semver'
 import { c2pConverter, p2cConverter, patchConverters, setDependencyBuildMode } from './utils/converters'
-import { collectAllOpenLeanDocumentUris } from './utils/docInfo'
 import { ExtUri, extUriEquals, parseExtUri, toExtUri } from './utils/exturi'
 import {
     displayError,
@@ -50,8 +45,7 @@ import {
     displayErrorWithOutput,
     displayInformationWithOptionalInput,
 } from './utils/notifs'
-import { willUseLakeServer } from './utils/projectInfo'
-import path = require('path')
+import path from 'path'
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
@@ -59,7 +53,7 @@ export type ServerProgress = Map<ExtUri, LeanFileProgressProcessingInfo[]>
 
 export class LeanClient implements Disposable {
     running: boolean
-    private client: LanguageClient | undefined
+    private client: BaseLanguageClient | undefined
     private outputChannel: OutputChannel
     folderUri: ExtUri
     private subscriptions: Disposable[] = []
@@ -108,7 +102,13 @@ export class LeanClient implements Disposable {
     private serverFailedEmitter = new EventEmitter<string>()
     serverFailed = this.serverFailedEmitter.event
 
-    constructor(folderUri: ExtUri, outputChannel: OutputChannel, elanDefaultToolchain: string) {
+    constructor(
+            folderUri: ExtUri, 
+            outputChannel: OutputChannel,
+            elanDefaultToolchain: string,
+            private setupClient: (clientOptions: LanguageClientOptions, folderUri: ExtUri, elanDefaultToolchain: string) => Promise<BaseLanguageClient>,
+            private isOpenLeanDocument : (docUri : ExtUri) => boolean
+        ) {
         this.outputChannel = outputChannel // can be null when opening adhoc files.
         this.folderUri = folderUri
         this.elanDefaultToolchain = elanDefaultToolchain
@@ -190,7 +190,8 @@ export class LeanClient implements Disposable {
 
         const startTime = Date.now()
         progress.report({ increment: 0 })
-        this.client = await this.setupClient()
+        this.client = await this.setupClient(this.obtainClientOptions(), this.folderUri, this.elanDefaultToolchain)
+        patchConverters(this.client.protocol2CodeConverter, this.client.code2ProtocolConverter);
 
         let insideRestart = true
         try {
@@ -432,43 +433,6 @@ export class LeanClient implements Disposable {
         return this.running ? this.client?.initializeResult : undefined
     }
 
-    private async determineServerOptions(): Promise<ServerOptions> {
-        const env = Object.assign({}, process.env)
-        if (serverLoggingEnabled()) {
-            env.LEAN_SERVER_LOG_DIR = serverLoggingPath()
-        }
-
-        const [serverExecutable, options] = await this.determineExecutable()
-
-        const cwd = this.folderUri.scheme === 'file' ? this.folderUri.fsPath : undefined
-        if (cwd) {
-            // Add folder name to command-line so that it shows up in `ps aux`.
-            options.push(cwd)
-        } else {
-            // Fixes issue #227, for adhoc files it would pick up the cwd from the open folder
-            // which is not what we want.  For adhoc files we want the (default) toolchain instead.
-            options.unshift('+' + this.elanDefaultToolchain)
-            options.push('untitled')
-        }
-
-        return {
-            command: serverExecutable,
-            args: options.concat(serverArgs()),
-            options: {
-                cwd,
-                env,
-            },
-        }
-    }
-
-    private async determineExecutable(): Promise<[string, string[]]> {
-        if (await willUseLakeServer(this.folderUri)) {
-            return ['lake', ['serve', '--']]
-        } else {
-            return ['lean', ['--server']]
-        }
-    }
-
     private obtainClientOptions(): LanguageClientOptions {
         const documentSelector: DocumentFilter = {
             language: 'lean4',
@@ -518,15 +482,13 @@ export class LeanClient implements Disposable {
                         return // This should never happen since the glob we launch the client for ensures that all uris are ext uris
                     }
 
-                    const openDocUris: ExtUri[] = collectAllOpenLeanDocumentUris()
-                    const docIsOpen = openDocUris.some(openDocUri => extUriEquals(openDocUri, docUri))
+                    const docIsOpen = this.isOpenLeanDocument(docUri)
 
                     if (!docIsOpen) {
                         // The language client library emits a `didOpen` notification when hovering over an identifier while holding `Ctrl` in order to provide a preview for the line that the definition is on.
                         // In Lean, this is very expensive and hence does not make much sense, so we filter these notification here.
                         // Should VS Code decide to send requests to a file that was filtered here, the language server will respond with an error, which VS Code will silently discard and interpret as having received an empty response.
                         // See https://github.com/microsoft/vscode/issues/78453 (the solution suggested in the thread is wrong, but `collectAllOpenLeanDocumentUris` works).
-                        return
                     }
 
                     if (this.openServerDocuments.has(docUri.toString())) {
@@ -601,15 +563,5 @@ export class LeanClient implements Disposable {
                 },
             },
         }
-    }
-
-    private async setupClient(): Promise<LanguageClient> {
-        const serverOptions: ServerOptions = await this.determineServerOptions()
-        const clientOptions: LanguageClientOptions = this.obtainClientOptions()
-
-        const client = new LanguageClient('lean4', 'Lean 4', serverOptions, clientOptions)
-
-        patchConverters(client.protocol2CodeConverter, client.code2ProtocolConverter)
-        return client
     }
 }

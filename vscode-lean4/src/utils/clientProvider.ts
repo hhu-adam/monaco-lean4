@@ -1,34 +1,13 @@
 import { LeanFileProgressProcessingInfo, ServerStoppedReason } from '@leanprover/infoview-api'
 import { Disposable, EventEmitter, OutputChannel, TextDocument, commands, window, workspace } from 'vscode'
-import {
-    checkAll,
-    checkIsLakeInstalledCorrectly,
-    checkIsLeanVersionUpToDate,
-    checkIsValidProjectFolder,
-} from '../diagnostics/setupDiagnostics'
 import { PreconditionCheckResult } from '../diagnostics/setupNotifs'
 import { LeanClient } from '../leanclient'
 import { ExtUri, FileUri, UntitledUri, getWorkspaceFolderUri, toExtUri } from './exturi'
 import { LeanInstaller } from './leanInstaller'
 import { logger } from './logger'
 import { displayError } from './notifs'
-import { findLeanProjectRoot, willUseLakeServer } from './projectInfo'
-
-async function checkLean4ProjectPreconditions(
-    channel: OutputChannel,
-    folderUri: ExtUri,
-): Promise<PreconditionCheckResult> {
-    return await checkAll(
-        () => checkIsValidProjectFolder(channel, folderUri),
-        () => checkIsLeanVersionUpToDate(channel, folderUri, { modal: false }),
-        async () => {
-            if (!(await willUseLakeServer(folderUri))) {
-                return 'Fulfilled'
-            }
-            return await checkIsLakeInstalledCorrectly(channel, folderUri, {})
-        },
-    )
-}
+import { findLeanProjectRoot } from './projectInfo'
+import { BaseLanguageClient, LanguageClientOptions } from 'vscode-languageclient/node'
 
 // This class ensures we have one LeanClient per folder.
 export class LeanClientProvider implements Disposable {
@@ -53,12 +32,20 @@ export class LeanClientProvider implements Disposable {
     private clientStoppedEmitter = new EventEmitter<[LeanClient, boolean, ServerStoppedReason]>()
     clientStopped = this.clientStoppedEmitter.event
 
-    constructor(installer: LeanInstaller, outputChannel: OutputChannel) {
+    constructor(
+            installer: LeanInstaller, 
+            outputChannel: OutputChannel,
+            private setupClient: (clientOptions: LanguageClientOptions, folderUri: ExtUri, elanDefaultToolchain: string) => Promise<BaseLanguageClient>,
+            private checkLean4ProjectPreconditions: (channel: OutputChannel, folderUri: ExtUri) => Promise<PreconditionCheckResult>,
+            private isOpenLeanDocument : (docUri : ExtUri) => boolean
+        ) {
         this.outputChannel = outputChannel
         this.installer = installer
 
         // we must setup the installChanged event handler first before any didOpenEditor calls.
-        installer.installChanged(async (uri: FileUri) => await this.onInstallChanged(uri))
+        this.subscriptions.push(
+            installer.installChanged(async (uri: FileUri) => await this.onInstallChanged(uri))
+        )
 
         window.visibleTextEditors.forEach(e => this.didOpenEditor(e.document))
         this.subscriptions.push(
@@ -77,24 +64,28 @@ export class LeanClientProvider implements Disposable {
             commands.registerCommand('lean4.stopServer', () => this.stopActiveClient()),
         )
 
-        workspace.onDidOpenTextDocument(document => this.didOpenEditor(document))
+        this.subscriptions.push(
+            workspace.onDidOpenTextDocument(document => this.didOpenEditor(document))
+        )
 
-        workspace.onDidChangeWorkspaceFolders(event => {
-            // Remove all clients that are not referenced by any folder anymore
-            if (event.removed.length === 0) {
-                return
-            }
-            this.clients.forEach((client, key) => {
-                if (client.folderUri.scheme === 'untitled' || getWorkspaceFolderUri(client.folderUri)) {
+        this.subscriptions.push(
+            workspace.onDidChangeWorkspaceFolders(event => {
+                // Remove all clients that are not referenced by any folder anymore
+                if (event.removed.length === 0) {
                     return
                 }
+                this.clients.forEach((client, key) => {
+                    if (client.folderUri.scheme === 'untitled' || getWorkspaceFolderUri(client.folderUri)) {
+                        return
+                    }
 
-                logger.log(`[ClientProvider] onDidChangeWorkspaceFolders removing client for ${key}`)
-                this.clients.delete(key)
-                client.dispose()
-                this.clientRemovedEmitter.fire(client)
+                    logger.log(`[ClientProvider] onDidChangeWorkspaceFolders removing client for ${key}`)
+                    this.clients.delete(key)
+                    client.dispose()
+                    this.clientRemovedEmitter.fire(client)
+                })
             })
-        })
+        )
     }
 
     getActiveClient(): LeanClient | undefined {
@@ -119,7 +110,7 @@ export class LeanClientProvider implements Disposable {
             try {
                 const projectUri = await findLeanProjectRoot(uri)
 
-                const preconditionCheckResult = await checkLean4ProjectPreconditions(this.outputChannel, projectUri)
+                const preconditionCheckResult = await this.checkLean4ProjectPreconditions(this.outputChannel, projectUri)
                 if (preconditionCheckResult !== 'Fatal') {
                     logger.log('[ClientProvider] got lean version 4')
                     const [cached, client] = await this.ensureClient(uri)
@@ -228,7 +219,7 @@ export class LeanClientProvider implements Disposable {
         }
         this.pending.set(key, true)
 
-        const preconditionCheckResult = await checkLean4ProjectPreconditions(this.outputChannel, folderUri)
+        const preconditionCheckResult = await this.checkLean4ProjectPreconditions(this.outputChannel, folderUri)
         if (preconditionCheckResult === 'Fatal') {
             this.pending.delete(key)
             return [false, undefined]
@@ -237,18 +228,18 @@ export class LeanClientProvider implements Disposable {
         logger.log('[ClientProvider] Creating LeanClient for ' + folderUri.toString())
         const elanDefaultToolchain = await this.installer.getElanDefaultToolchain(folderUri)
 
-        client = new LeanClient(folderUri, this.outputChannel, elanDefaultToolchain)
+        client = new LeanClient(folderUri, this.outputChannel, elanDefaultToolchain, this.setupClient, this.isOpenLeanDocument)
         this.subscriptions.push(client)
         this.clients.set(key, client)
 
         client.serverFailed(err => {
             this.clients.delete(key)
-            client.dispose()
+            client!.dispose()
             displayError(err)
         })
 
         client.stopped(reason => {
-            this.clientStoppedEmitter.fire([client, client === this.activeClient, reason])
+            this.clientStoppedEmitter.fire([client!, client === this.activeClient, reason])
         })
 
         // aggregate progress changed events.
